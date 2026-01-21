@@ -1,211 +1,235 @@
---==================================================
--- Demonfall Hub (Clean + Debug + Discord Logger)
--- Upload-ready | Raw-executable
---==================================================
+--[[ 
+    Webhook Logger Hub
+    UI : Rayfield
+    Discord : Webhook ONLY (NO BOT)
+]]
 
---========================
--- CONFIG
---========================
-local DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1463366559165579335/Vm7zuN-JxH4-ymbnLYpEd-CnEykovDgCS0A5sYYQ16AFb_aSKdDj9xHMbeOAExe7xNWk"
-
---========================
--- SERVICES
---========================
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local HttpService = game:GetService("HttpService")
-local player = Players.LocalPlayer
-
---========================
+----------------------------
 -- LOAD RAYFIELD
---========================
+----------------------------
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 
---========================
--- DEBUG STATE
---========================
-_G.DebugLog = {}
-_G.LastStackTrace = nil
-_G.DebugEnabled = true
+----------------------------
+-- SERVICES
+----------------------------
+local HttpService = game:GetService("HttpService")
+local LogService = game:GetService("LogService")
 
---========================
+----------------------------
 -- LOGGER CORE
---========================
-local function log(msg)
-    local line = os.date("[%H:%M:%S] ") .. tostring(msg)
-    table.insert(_G.DebugLog, line)
-    if _G.DebugEnabled then print(line) end
-end
+----------------------------
+local Logger = {}
+local state = {
+    webhook = nil,
+    enabled = false,
+    queue = {},
+    sending = false,
+    interval = 1.5,
+    redact = true,
+    forwardLogs = false
+}
 
-local function logError(msg)
-    local line = os.date("[%H:%M:%S][ERROR] ") .. tostring(msg)
-    table.insert(_G.DebugLog, line)
-    warn(line)
-end
-
---========================
--- REDACTION
---========================
-local function redact(text)
-    text = text:gsub("https://discord.com/api/webhooks/%S+", "[REDACTED_WEBHOOK]")
-    text = text:gsub("https?://[%w%p]+", "[REDACTED_URL]")
-    text = text:gsub("[%w%+/=]{20,}", "[REDACTED_TOKEN]")
-    return text
-end
-
---========================
--- DISCORD WEBHOOK
---========================
-local lastSent = 0
-local function sendDiscord(title, content)
-    if os.clock() - lastSent < 5 then return end
-    lastSent = os.clock()
-
-    task.spawn(function()
-        pcall(function()
-            game:HttpPostAsync(
-                DISCORD_WEBHOOK,
-                HttpService:JSONEncode({
-                    embeds = {{
-                        title = title,
-                        description = content,
-                        color = 15158332,
-                        footer = { text = "Demonfall Hub Debug" },
-                        timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
-                    }}
-                }),
-                Enum.HttpContentType.ApplicationJson
-            )
-        end)
-    end)
-end
-
---========================
--- STACK TRACE HANDLER
---========================
-local function handleError(err, context)
-    local trace = debug.traceback(tostring(err), 2)
-    _G.LastStackTrace = {
-        time = os.date(),
-        context = context,
-        error = tostring(err),
-        trace = trace
-    }
-
-    logError(context .. ": " .. err)
-    sendDiscord(
-        "❌ Script Error - " .. context,
-        "```lua\n" .. redact(trace) .. "\n```"
-    )
-end
-
---========================
--- SAFE CALLBACK
---========================
-local function WrapCallback(name, fn)
-    return function(...)
-        log("CALLBACK -> " .. name)
-        local ok, res = xpcall(function()
-            return fn(...)
-        end, function(err)
-            handleError(err, "Callback: " .. name)
-        end)
-        if ok then return res end
+----------------------------
+-- HTTP REQUEST PICKER
+----------------------------
+local function requestHTTP(data)
+    if syn and syn.request then
+        return syn.request(data)
+    elseif request then
+        return request(data)
+    elseif HttpService.RequestAsync then
+        return HttpService:RequestAsync(data)
     end
 end
 
---========================
--- SAFE LOOP
---========================
-local function StartLoop(name, delay, fn)
+----------------------------
+-- REDACTION
+----------------------------
+local function redact(text)
+    if not state.redact then return text end
+    text = text:gsub("https://discord.com/api/webhooks/%S+", "[REDACTED_WEBHOOK]")
+    text = text:gsub("[A-Za-z0-9_%-]+%.[A-Za-z0-9_%-]+%.[A-Za-z0-9_%-]+", "[REDACTED_TOKEN]")
+    return text
+end
+
+----------------------------
+-- QUEUE SENDER
+----------------------------
+local function processQueue()
+    if state.sending then return end
+    state.sending = true
+
     task.spawn(function()
-        log("Loop started: " .. name)
-        while true do
-            local ok = xpcall(fn, function(err)
-                handleError(err, "Loop: " .. name)
-                task.wait(1)
+        while #state.queue > 0 do
+            local payload = table.remove(state.queue, 1)
+
+            local body = {
+                content = payload
+            }
+
+            pcall(function()
+                requestHTTP({
+                    Url = state.webhook,
+                    Method = "POST",
+                    Headers = { ["Content-Type"] = "application/json" },
+                    Body = HttpService:JSONEncode(body)
+                })
             end)
-            task.wait(delay or 0.2)
+
+            task.wait(state.interval)
         end
+        state.sending = false
     end)
 end
 
---========================
--- UI WINDOW
---========================
+----------------------------
+-- SEND FUNCTION
+----------------------------
+function Logger.send(msg)
+    if not state.enabled then return end
+    msg = redact(tostring(msg))
+    table.insert(state.queue, msg)
+    processQueue()
+end
+
+function Logger.info(msg)
+    Logger.send("🟢 **INFO**\n" .. msg)
+end
+
+function Logger.warn(msg)
+    Logger.send("🟡 **WARN**\n" .. msg)
+end
+
+function Logger.error(msg, stack)
+    local text = "🔴 **ERROR**\n" .. msg
+    if stack then
+        text = text .. "\n```" .. debug.traceback("", 2) .. "```"
+    end
+    Logger.send(text)
+end
+
+----------------------------
+-- FORWARD LOGSERVICE
+----------------------------
+local logConnection
+local function toggleForward(stateOn)
+    state.forwardLogs = stateOn
+
+    if stateOn and not logConnection then
+        logConnection = LogService.MessageOut:Connect(function(msg, msgType)
+            if msgType == Enum.MessageType.MessageError then
+                Logger.error(msg, true)
+            elseif msgType == Enum.MessageType.MessageWarning then
+                Logger.warn(msg)
+            end
+        end)
+    elseif not stateOn and logConnection then
+        logConnection:Disconnect()
+        logConnection = nil
+    end
+end
+
+----------------------------
+-- INIT LOGGER
+----------------------------
+function Logger.init(webhook)
+    state.webhook = webhook
+    state.enabled = true
+    Logger.info("Webhook Logger Initialized")
+end
+
+----------------------------
+-- RAYFIELD UI
+----------------------------
 local Window = Rayfield:CreateWindow({
-    Name = "Demonfall Hub",
-    LoadingTitle = "Demonfall",
-    LoadingSubtitle = "Clean Debug Hub",
+    Name = "Webhook Logger Hub",
+    LoadingTitle = "Webhook Logger",
+    LoadingSubtitle = "Rayfield Hub",
     ConfigurationSaving = {
         Enabled = true,
-        FolderName = "DemonfallHub",
+        FolderName = "WebhookLogger",
         FileName = "Config"
     }
 })
 
---========================
--- FLAGS
---========================
-_G.AutoFarm = false
+local Tab = Window:CreateTab("Logger", 4483362458)
+Tab:CreateSection("Discord Webhook")
 
---========================
--- AUTOFARM TAB
---========================
-local FarmTab = Window:CreateTab("AutoFarm")
-
-FarmTab:CreateToggle({
-    Name = "Auto Farm",
-    CurrentValue = false,
-    Callback = WrapCallback("AutoFarm Toggle", function(v)
-        _G.AutoFarm = v
-    end)
+local webhookInput = ""
+Tab:CreateInput({
+    Name = "Webhook URL",
+    PlaceholderText = "https://discord.com/api/webhooks/...",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(text)
+        webhookInput = text
+    end
 })
 
-StartLoop("AutoFarm", 0.3, function()
-    if not _G.AutoFarm then return end
-    local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
-    if hrp then
-        hrp.CFrame = hrp.CFrame * CFrame.new(0, 0, -1)
+Tab:CreateButton({
+    Name = "Init Webhook",
+    Callback = function()
+        if webhookInput == "" then
+            Rayfield:Notify({
+                Title = "Logger",
+                Content = "Masukkan webhook terlebih dahulu",
+                Duration = 3
+            })
+            return
+        end
+        Logger.init(webhookInput)
+        Rayfield:Notify({
+            Title = "Logger",
+            Content = "Webhook berhasil diinisialisasi",
+            Duration = 3
+        })
     end
-end)
+})
 
---========================
--- DEBUG TAB
---========================
-local DebugTab = Window:CreateTab("Debug")
+Tab:CreateButton({
+    Name = "Send Test Log",
+    Callback = function()
+        Logger.info("Test log dari Hub")
+    end
+})
 
-DebugTab:CreateToggle({
-    Name = "Enable Debug",
+Tab:CreateButton({
+    Name = "Send Error Test",
+    Callback = function()
+        Logger.error("Ini error test", true)
+    end
+})
+
+Tab:CreateToggle({
+    Name = "Forward Roblox Errors → Discord",
+    CurrentValue = false,
+    Callback = function(v)
+        toggleForward(v)
+    end
+})
+
+Tab:CreateToggle({
+    Name = "Redact Webhook / Token",
     CurrentValue = true,
     Callback = function(v)
-        _G.DebugEnabled = v
-        log("Debug: " .. (v and "ON" or "OFF"))
+        state.redact = v
     end
 })
 
-DebugTab:CreateButton({
-    Name = "Dump Logs (Console)",
-    Callback = function()
-        print("===== DEBUG LOG =====")
-        for i, v in ipairs(_G.DebugLog) do
-            print(i, redact(v))
-        end
+Tab:CreateSlider({
+    Name = "Rate Limit (detik)",
+    Range = {0.5, 5},
+    Increment = 0.5,
+    CurrentValue = 1.5,
+    Callback = function(v)
+        state.interval = v
     end
 })
 
-DebugTab:CreateButton({
-    Name = "Send Last Error to Discord",
-    Callback = function()
-        if _G.LastStackTrace then
-            sendDiscord(
-                "📤 Manual Error Report",
-                "```lua\n" .. redact(_G.LastStackTrace.trace) .. "\n```"
-            )
-        else
-            log("No error recorded")
-        end
-    end
+----------------------------
+-- READY
+----------------------------
+Rayfield:Notify({
+    Title = "Webhook Logger",
+    Content = "Hub siap digunakan (Webhook Only)",
+    Duration = 4
 })
-
-log("Demonfall Hub loaded successfully")
